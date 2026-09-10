@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Cam Show
  * Description: Monitors a list of Chaturbate rooms and shows an affiliate embed player in the bottom-right corner of the site when one goes live. Configure under Settings → Cam Show.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: shad-base
  * License: GPL-2.0-or-later
  * Text Domain: wp-camshow
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBCS_VERSION', '1.0.0' );
+define( 'CBCS_VERSION', '1.0.1' );
 define( 'CBCS_OPTION_KEY', 'cbcs_settings' );
 
 function cbcs_default_settings() {
@@ -77,20 +77,23 @@ function cbcs_sanitize_settings( $input ) {
 	return $out;
 }
 
-function cbcs_fetch_room_status( $room ) {
+function cbcs_api_url( $room ) {
 	$base = trailingslashit( apply_filters( 'cbcs_api_base', 'https://chaturbate.com/api/chatvideocontext/' ) );
-	$url  = $base . rawurlencode( $room ) . '/';
+	return $base . rawurlencode( $room ) . '/';
+}
 
-	$response = wp_remote_get(
-		$url,
-		array(
-			'timeout' => 4,
-			'headers' => array(
-				'User-Agent' => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-				'Accept'     => 'application/json, text/plain, */*',
-			),
-		)
+function cbcs_http_args() {
+	return array(
+		'timeout' => 5,
+		'headers' => array(
+			'User-Agent' => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+			'Accept'     => 'application/json, text/plain, */*',
+		),
 	);
+}
+
+function cbcs_fetch_room_status( $room ) {
+	$response = wp_remote_get( cbcs_api_url( $room ), cbcs_http_args() );
 
 	if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
 		return 'error';
@@ -102,6 +105,40 @@ function cbcs_fetch_room_status( $room ) {
 	}
 
 	return ( 'public' === $body['room_status'] ) ? 'live' : 'offline';
+}
+
+function cbcs_probe_room( $room ) {
+	$key    = 'cbcs_status_' . md5( $room );
+	$cached = get_transient( $key );
+
+	$result = array(
+		'room'         => $room,
+		'cached'       => ( false === $cached ) ? 'none' : (string) $cached,
+		'http_code'    => '',
+		'status'       => 'error',
+		'room_status'  => '',
+		'snippet'      => '',
+		'url'          => cbcs_api_url( $room ),
+	);
+
+	$response = wp_remote_get( $result['url'], cbcs_http_args() );
+
+	if ( is_wp_error( $response ) ) {
+		$result['snippet'] = 'WP_Error: ' . $response->get_error_message();
+		return $result;
+	}
+
+	$result['http_code'] = (string) (int) wp_remote_retrieve_response_code( $response );
+	$body                = wp_remote_retrieve_body( $response );
+	$result['snippet']   = trim( substr( (string) $body, 0, 160 ) );
+
+	$decoded = json_decode( (string) $body, true );
+	if ( is_array( $decoded ) && ! empty( $decoded['room_status'] ) ) {
+		$result['room_status'] = (string) $decoded['room_status'];
+		$result['status']      = ( 'public' === $decoded['room_status'] ) ? 'live' : 'offline';
+	}
+
+	return $result;
 }
 
 function cbcs_room_status( $room ) {
@@ -319,6 +356,69 @@ function cbcs_render_settings_page() {
 			</table>
 			<?php submit_button(); ?>
 		</form>
+
+		<hr>
+		<h2><?php esc_html_e( 'Live status', 'wp-camshow' ); ?></h2>
+		<p class="description">
+			<?php esc_html_e( 'Per-room checks from this server right now. Use this to confirm whether the chaturbate.com API is reachable from your web host (some datacenters get 403). Cached values come from the 90s transient; the probe always makes a fresh request.', 'wp-camshow' ); ?>
+		</p>
+
+		<?php
+		$rooms_list  = cbcs_get_rooms();
+		$next_cron  = wp_next_scheduled( 'cbcs_cron_refresh' );
+		?>
+		<p>
+			<strong><?php esc_html_e( 'Cron refresher:', 'wp-camshow' ); ?></strong>
+			<?php
+			if ( $next_cron ) {
+				echo esc_html( human_time_diff( time(), $next_cron ) . ' ' . __( 'from now', 'wp-camshow' ) );
+			} else {
+				echo '<span style="color:#c00">' . esc_html__( 'Not scheduled', 'wp-camshow' ) . '</span>';
+			}
+			?>
+		</p>
+
+		<?php if ( empty( $rooms_list ) ) : ?>
+			<p><em><?php esc_html_e( 'Add rooms above to see live checks.', 'wp-camshow' ); ?></em></p>
+		<?php else : ?>
+			<table class="widefat striped" style="max-width:980px">
+				<thead>
+					<tr>
+						<th><?php esc_html_e( 'Room', 'wp-camshow' ); ?></th>
+						<th><?php esc_html_e( 'Cached', 'wp-camshow' ); ?></th>
+						<th><?php esc_html_e( 'Fresh probe', 'wp-camshow' ); ?></th>
+						<th><?php esc_html_e( 'HTTP', 'wp-camshow' ); ?></th>
+						<th><?php esc_html_e( 'room_status', 'wp-camshow' ); ?></th>
+						<th><?php esc_html_e( 'Body snippet', 'wp-camshow' ); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $rooms_list as $room ) :
+						$p = cbcs_probe_room( $room );
+						$row_color = '';
+						if ( 'live' === $p['status'] ) {
+							$row_color = 'background:#e8f6ee';
+						} elseif ( 'offline' === $p['status'] ) {
+							$row_color = 'background:#fff';
+						} else {
+							$row_color = 'background:#fdecea';
+						}
+						?>
+						<tr style="<?php echo esc_attr( $row_color ); ?>">
+							<td><code>@<?php echo esc_html( $room ); ?></code></td>
+							<td><?php echo esc_html( $p['cached'] ); ?></td>
+							<td><strong><?php echo esc_html( $p['status'] ); ?></strong></td>
+							<td><?php echo esc_html( $p['http_code'] ); ?></td>
+							<td><?php echo esc_html( $p['room_status'] ); ?></td>
+							<td style="font-family:monospace;font-size:11px;word-break:break-all;max-width:420px"><?php echo esc_html( $p['snippet'] ); ?></td>
+						</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+			<p class="description" style="max-width:980px">
+				<?php esc_html_e( 'If "Fresh probe" shows "error" with HTTP 403 / 503 / a Cloudflare challenge page, your web server is being blocked by Chaturbate. In that case the plugin cannot detect live status from this server. Add `add_filter( "cbcs_api_base", fn() => "https://your-affiliate-whitelist-host/api/chatvideocontext/" );` (or use the alternative JSON endpoint via `cbcs_api_base`) via a small mu-plugin or your theme. A page-cache plugin (LiteSpeed/WP Super Cache/Cloudflare APO) may also be serving a cached page that omits the player; purge the cache after going live.', 'wp-camshow' ); ?>
+			</p>
+		<?php endif; ?>
 	</div>
 	<?php
 }
