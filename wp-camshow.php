@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Cam Show
  * Description: Monitors a list of Chaturbate rooms and shows an affiliate embed player in the bottom-right corner of the site when one goes live. Configure under Settings → Cam Show.
- * Version: 1.0.1
+ * Version: 1.1.0
  * Author: shad-base
  * License: GPL-2.0-or-later
  * Text Domain: wp-camshow
@@ -13,20 +13,22 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBCS_VERSION', '1.0.1' );
+define( 'CBCS_VERSION', '1.1.0' );
 define( 'CBCS_OPTION_KEY', 'cbcs_settings' );
 
 function cbcs_default_settings() {
 	return array(
-		'enabled'  => 1,
-		'campaign' => 'r9k9h',
-		'tour'     => 'SHBY',
-		'track'    => 'embed',
-		'rooms'    => '',
-		'small_w'  => 420,
-		'small_h'  => 260,
-		'large_w'  => 850,
-		'large_h'  => 528,
+		'enabled'    => 1,
+		'campaign'   => 'r9k9h',
+		'tour'       => 'SHBY',
+		'track'      => 'embed',
+		'rooms'      => '',
+		'mode'       => 'live_only',
+		'status_url' => '',
+		'small_w'    => 420,
+		'small_h'    => 260,
+		'large_w'    => 850,
+		'large_h'    => 528,
 	);
 }
 
@@ -48,11 +50,60 @@ function cbcs_get_rooms() {
 	return $rooms;
 }
 
+function cbcs_get_mode() {
+	$mode = cbcs_get_settings();
+	$mode = isset( $mode['mode'] ) ? (string) $mode['mode'] : 'live_only';
+	return in_array( $mode, array( 'live_only', 'always_show', 'external_json' ), true ) ? $mode : 'live_only';
+}
+
+function cbcs_fetch_external_status_map( $url ) {
+	$cache_key = 'cbcs_ext_' . md5( $url );
+	$cached    = get_transient( $cache_key );
+	if ( is_array( $cached ) && isset( $cached['map'] ) && is_array( $cached['map'] ) ) {
+		return array( 'map' => $cached['map'], 'cached' => true );
+	}
+
+	$response = wp_remote_get(
+		$url,
+		array(
+			'timeout' => 5,
+			'headers' => array( 'Accept' => 'application/json, text/plain, */*' ),
+		)
+	);
+
+	if ( is_wp_error( $response ) ) {
+		return array( 'map' => array(), 'error' => $response->get_error_message() );
+	}
+
+	$code = (int) wp_remote_retrieve_response_code( $response );
+	if ( 200 !== $code ) {
+		return array( 'map' => array(), 'error' => 'HTTP ' . $code );
+	}
+
+	$body = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+	$map  = ( is_array( $body ) ) ? $body : array();
+
+	set_transient( $cache_key, array( 'map' => $map ), 60 );
+
+	return array( 'map' => $map, 'cached' => false );
+}
+
 function cbcs_sanitize_settings( $input ) {
 	$input = is_array( $input ) ? $input : array();
 	$out   = cbcs_default_settings();
 
 	$out['enabled'] = empty( $input['enabled'] ) ? 0 : 1;
+
+	$mode_in         = isset( $input['mode'] ) ? (string) $input['mode'] : 'live_only';
+	$out['mode']     = in_array( $mode_in, array( 'live_only', 'always_show', 'external_json' ), true ) ? $mode_in : 'live_only';
+
+	$url_in = isset( $input['status_url'] ) ? trim( (string) $input['status_url'] ) : '';
+	if ( '' === $url_in || 'external_json' !== $out['mode'] ) {
+		$out['status_url'] = '';
+	} else {
+		$url_clean       = esc_url_raw( $url_in );
+		$out['status_url'] = ( '' !== $url_clean && preg_match( '#^https?://#', $url_clean ) ) ? $url_clean : '';
+	}
 
 	foreach ( array( 'campaign', 'tour', 'track' ) as $key ) {
 		$out[ $key ] = preg_replace( '/[^A-Za-z0-9_\-]/', '', (string) ( isset( $input[ $key ] ) ? $input[ $key ] : '' ) );
@@ -158,7 +209,34 @@ function cbcs_room_status( $room ) {
 }
 
 function cbcs_get_live_room() {
-	foreach ( cbcs_get_rooms() as $room ) {
+	$rooms = cbcs_get_rooms();
+	if ( empty( $rooms ) ) {
+		return '';
+	}
+
+	$mode = cbcs_get_mode();
+
+	if ( 'always_show' === $mode ) {
+		return $rooms[0];
+	}
+
+	if ( 'external_json' === $mode ) {
+		$settings = cbcs_get_settings();
+		$url      = isset( $settings['status_url'] ) ? (string) $settings['status_url'] : '';
+		if ( '' === $url ) {
+			return '';
+		}
+		$result = cbcs_fetch_external_status_map( $url );
+		$map    = isset( $result['map'] ) ? $result['map'] : array();
+		foreach ( $rooms as $room ) {
+			if ( ! empty( $map[ $room ] ) ) {
+				return $room;
+			}
+		}
+		return '';
+	}
+
+	foreach ( $rooms as $room ) {
 		if ( 'live' === cbcs_room_status( $room ) ) {
 			return $room;
 		}
@@ -340,6 +418,33 @@ function cbcs_render_settings_page() {
 					</td>
 				</tr>
 				<tr>
+					<th scope="row"><?php esc_html_e( 'Detection mode', 'wp-camshow' ); ?></th>
+					<td>
+						<label style="display:block;margin-bottom:6px">
+							<input type="radio" name="cbcs_settings[mode]" value="live_only" <?php checked( $settings['mode'], 'live_only' ); ?>>
+							<strong><?php esc_html_e( 'Live only', 'wp-camshow' ); ?></strong> —
+							<?php esc_html_e( 'the server polls chaturbate.com; widget only renders for live rooms. Fastest, but requires the host IP to be allowed by Chaturbate/Cloudflare.', 'wp-camshow' ); ?>
+						</label>
+						<label style="display:block;margin-bottom:6px">
+							<input type="radio" name="cbcs_settings[mode]" value="always_show" <?php checked( $settings['mode'], 'always_show' ); ?>>
+							<strong><?php esc_html_e( 'Always show', 'wp-camshow' ); ?></strong> —
+							<?php esc_html_e( 'skip the live check; the widget renders the first room permanently. CB\'s own embed page shows the offline placeholder when the room is offline. Use this when your host IP is blocked.', 'wp-camshow' ); ?>
+						</label>
+						<label style="display:block">
+							<input type="radio" name="cbcs_settings[mode]" value="external_json" <?php checked( $settings['mode'], 'external_json' ); ?>>
+							<strong><?php esc_html_e( 'External JSON', 'wp-camshow' ); ?></strong> —
+							<?php esc_html_e( 'poll a remote URL returning JSON like {"room1": true, "room2": false}; pair with a Cloudflare Worker or other relay hosted on a non-blocked IP.', 'wp-camshow' ); ?>
+						</label>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="cbcs-status-url"><?php esc_html_e( 'Status URL', 'wp-camshow' ); ?></label></th>
+					<td>
+						<input id="cbcs-status-url" type="url" class="regular-text code" name="cbcs_settings[status_url]" value="<?php echo esc_attr( $settings['status_url'] ); ?>" placeholder="https://your-worker.example.com/chaturbate-status.json">
+						<p class="description"><?php esc_html_e( 'Required only when Detection mode is "External JSON". Document body: a JSON object mapping Chaturbate usernames to booleans.', 'wp-camshow' ); ?></p>
+					</td>
+				</tr>
+				<tr>
 					<th scope="row"><?php esc_html_e( 'Small player size', 'wp-camshow' ); ?></th>
 					<td>
 						<label>W <input type="number" min="240" step="1" class="small-text" name="cbcs_settings[small_w]" value="<?php echo esc_attr( (string) $settings['small_w'] ); ?>"> px</label>
@@ -360,14 +465,17 @@ function cbcs_render_settings_page() {
 		<hr>
 		<h2><?php esc_html_e( 'Live status', 'wp-camshow' ); ?></h2>
 		<p class="description">
-			<?php esc_html_e( 'Per-room checks from this server right now. Use this to confirm whether the chaturbate.com API is reachable from your web host (some datacenters get 403). Cached values come from the 90s transient; the probe always makes a fresh request.', 'wp-camshow' ); ?>
+			<?php esc_html_e( 'Per-room checks from this server right now. Use this to confirm whether the chaturbate.com API is reachable from your web host (some datacenters get 403). Cached values come from the 90s transient; the probe always makes a fresh request. The probe is informational — if it shows error, switch the Detection mode above to "Always show" or "External JSON" to keep the embed working.', 'wp-camshow' ); ?>
 		</p>
 
 		<?php
 		$rooms_list  = cbcs_get_rooms();
-		$next_cron  = wp_next_scheduled( 'cbcs_cron_refresh' );
+		$mode        = cbcs_get_mode();
+		$next_cron   = wp_next_scheduled( 'cbcs_cron_refresh' );
 		?>
 		<p>
+			<strong><?php esc_html_e( 'Active mode:', 'wp-camshow' ); ?></strong> <code><?php echo esc_html( $mode ); ?></code>
+			&nbsp;|&nbsp;
 			<strong><?php esc_html_e( 'Cron refresher:', 'wp-camshow' ); ?></strong>
 			<?php
 			if ( $next_cron ) {
@@ -377,6 +485,44 @@ function cbcs_render_settings_page() {
 			}
 			?>
 		</p>
+
+		<?php if ( 'external_json' === $mode ) :
+			$status_url = (string) ( $settings['status_url'] ?? '' );
+			?>
+			<h3><?php esc_html_e( 'External status source', 'wp-camshow' ); ?></h3>
+			<?php if ( '' === $status_url ) : ?>
+				<p style="color:#c00"><em><?php esc_html_e( 'No status URL configured.', 'wp-camshow' ); ?></em></p>
+			<?php else : ?>
+				<?php $ext = cbcs_fetch_external_status_map( $status_url ); ?>
+				<table class="widefat striped" style="max-width:980px">
+					<tr>
+						<th style="width:160px"><?php esc_html_e( 'URL', 'wp-camshow' ); ?></th>
+						<td><code style="word-break:break-all"><?php echo esc_html( $status_url ); ?></code></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e( 'Result', 'wp-camshow' ); ?></th>
+						<td>
+							<?php if ( ! empty( $ext['error'] ) ) : ?>
+								<span style="color:#c00"><?php echo esc_html( $ext['error'] ); ?></span>
+							<?php elseif ( ! empty( $ext['cached'] ) ) : ?>
+								<?php esc_html_e( 'OK (60s cache)', 'wp-camshow' ); ?>
+							<?php else : ?>
+								<?php esc_html_e( 'OK (fresh fetch)', 'wp-camshow' ); ?>
+							<?php endif; ?>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e( 'Live rooms', 'wp-camshow' ); ?></th>
+						<td>
+							<?php
+							$live = array_keys( array_filter( (array) ( $ext['map'] ?? array() ) ) );
+							echo $live ? esc_html( implode( ', ', $live ) ) : '<em>' . esc_html__( 'none reported live', 'wp-camshow' ) . '</em>';
+							?>
+						</td>
+					</tr>
+				</table>
+			<?php endif; ?>
+		<?php endif; ?>
 
 		<?php if ( empty( $rooms_list ) ) : ?>
 			<p><em><?php esc_html_e( 'Add rooms above to see live checks.', 'wp-camshow' ); ?></em></p>
@@ -416,7 +562,7 @@ function cbcs_render_settings_page() {
 				</tbody>
 			</table>
 			<p class="description" style="max-width:980px">
-				<?php esc_html_e( 'If "Fresh probe" shows "error" with HTTP 403 / 503 / a Cloudflare challenge page, your web server is being blocked by Chaturbate. In that case the plugin cannot detect live status from this server. Add `add_filter( "cbcs_api_base", fn() => "https://your-affiliate-whitelist-host/api/chatvideocontext/" );` (or use the alternative JSON endpoint via `cbcs_api_base`) via a small mu-plugin or your theme. A page-cache plugin (LiteSpeed/WP Super Cache/Cloudflare APO) may also be serving a cached page that omits the player; purge the cache after going live.', 'wp-camshow' ); ?>
+				<?php esc_html_e( 'If "Fresh probe" shows "error" with HTTP 403 / 503 / a Cloudflare challenge page, your web server is being blocked by Chaturbate. The plugin cannot detect live status from this server in that case. Switch Detection mode to "Always show" or "External JSON" to keep the embed working. A page-cache plugin (LiteSpeed/WP Super Cache/Cloudflare APO) may also be serving a cached page that omits the player; purge the cache after changing settings.', 'wp-camshow' ); ?>
 			</p>
 		<?php endif; ?>
 	</div>
